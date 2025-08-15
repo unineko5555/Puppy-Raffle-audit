@@ -108,7 +108,8 @@ receive() external payable {}
 1. **リエントランシー攻撃** (`selectWinner()`, `refund()`)
 2. **弱い乱数生成** (予測可能な値の使用)
 3. **任意ユーザーへのETH送金** (検証不足)
-4. **ガス効率問題** (配列長キャッシュ不足等)
+4. **DoS攻撃脆弱性** (O(n²)重複チェック)
+5. **ガス効率問題** (配列長キャッシュ不足等)
 
 ## テスト結果
 
@@ -135,7 +136,44 @@ Suite result: ok. 20 passed; 0 failed; 0 skipped
 ### セキュリティ分析の充実
 - **静的解析**: Slitherによる包括的脆弱性検出
 - **動的テスト**: 20種類のテストシナリオによる検証
+- **複合解析**: AderynとSlitherによる相互補完的解析
 - **文書化**: 詳細な解析レポート作成
+
+### 重要な脆弱性発見
+
+#### DoS攻撃脆弱性（O(n²)問題）
+**Aderyn検出**: L-7, L-9, L-10で複合的に検出
+
+**脆弱性のあるコード**:
+```solidity
+// src/PuppyRaffle.sol:108-112
+for (uint256 i = 0; i < players.length - 1; i++) {
+    for (uint256 j = i + 1; j < players.length; j++) {
+        require(players[i] != players[j], "PuppyRaffle: Duplicate player");
+    }
+}
+```
+
+**問題の深刻度**:
+- **100人の参加者**: 約5,000回の比較演算
+- **1,000人の参加者**: 約500,000回の比較演算
+- **攻撃シナリオ**: 意図的に大量参加者でガス制限到達を誘発
+
+**推奨修正方法**:
+```solidity
+// O(n)解決案
+mapping(address => bool) private playersMapping;
+
+function enterRaffle(address[] memory newPlayers) public payable {
+    for (uint256 i = 0; i < newPlayers.length; i++) {
+        require(!playersMapping[newPlayers[i]], "PuppyRaffle: Duplicate player");
+        playersMapping[newPlayers[i]] = true;
+        players.push(newPlayers[i]);
+    }
+}
+```
+
+**教育的価値**: アルゴリズム計算量の重要性とガス効率の実践的理解
 
 ## 開発者ガイド
 
@@ -157,8 +195,15 @@ forge test
 # Slither静的解析
 slither src/PuppyRaffle.sol
 
+# Aderyn静的解析（推奨）
+aderyn .
+
 # 詳細レポート確認
 cat slither.md
+cat aderyn.md
+
+# 比較分析
+diff slither.md aderyn.md
 ```
 
 ### 修正履歴確認
