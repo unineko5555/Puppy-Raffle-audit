@@ -258,21 +258,113 @@ contract PuppyRaffleTest is Test {
         puppyRaffle.selectWinner();
     }
 
-    //uint64(fee)のoverflowのテスト
+    //uint64(fee)のoverflowのテスト - uint64キャストによるオーバーフロー実証
     function testOverflow() public {
-        uint256 initialBalance = address(puppyRaffle).balance;
+        // Demonstrate uint64 casting overflow behavior (similar to selectWinner vulnerability)
+        console.log("=== Demonstrating uint64 Casting Overflow ===");
+        
+        // Test values that exceed uint64 maximum
+        uint256 largeValue1 = 20 ether;  // 20 ETH
+        uint256 largeValue2 = 200 ether; // 200 ETH (like 1000 participants fee)
+        uint256 uint64Max = type(uint64).max;
+        
+        console.log("uint64 maximum value:", uint64Max);
+        console.log("uint64 max in ETH:", uint64Max / 1e18);
+        
+        // Show what happens with uint64 casting (no unchecked needed - casting is allowed)
+        uint64 casted1 = uint64(largeValue1);
+        uint64 casted2 = uint64(largeValue2);
+        
+        console.log("Original value 20 ETH:", largeValue1);
+        console.log("After uint64 cast:", casted1);
+        console.log("Value loss:", largeValue1 - casted1);
+        
+        console.log("Original value 200 ETH:", largeValue2);
+        console.log("After uint64 cast:", casted2);
+        console.log("Value loss:", largeValue2 - casted2);
+        
+        // Demonstrate the actual vulnerability pattern from selectWinner
+        uint256 mockTotalFees = 0;
+        uint256 mockFee = 200 ether; // Large fee like 1000 participants
+        
+        // This is what happens in selectWinner: totalFees = totalFees + uint64(fee);
+        mockTotalFees = mockTotalFees + uint64(mockFee);
+        
+        console.log("Expected fee to be recorded:", mockFee);
+        console.log("Actually recorded fee:", mockTotalFees);
+        console.log("Fee loss due to uint64 cast:", mockFee - mockTotalFees);
+        
+        // Assertions to prove the overflow
+        assertTrue(casted2 < largeValue2, "uint64 cast should reduce large values");
+        assertTrue(mockTotalFees < mockFee, "Mock totalFees should be smaller than original fee");
+        
+        // Show the wrap-around behavior 
+        // Note: uint64 casting wraps values larger than 2^64-1
+        console.log("=== Vulnerability Confirmed: uint64 casting causes value truncation ===");
+        
+        // The key insight: uint64 casting silently truncates large values
+        // This is exactly what happens in selectWinner() with totalFees += uint64(fee)
+        console.log("This demonstrates the selectWinner vulnerability:");
+        console.log("- Large fees (>18.4 ETH) are silently truncated");
+        console.log("- Protocol loses significant fee revenue");
+        console.log("- No revert occurs - vulnerability is silent");
+    }
 
-        // This value is greater than the maximum value a uint64 can hold
-        uint256 fee = 2**64; 
+    // Real-world overflow scenario using actual contract interactions
+    function testTotalFeesOverflow() public playersEntered {
+        // We finish a raffle of 4 to collect some fees
+        vm.warp(block.timestamp + duration + 1);
+        vm.roll(block.number + 1);
+        puppyRaffle.selectWinner();
+        uint256 startingTotalFees = puppyRaffle.totalFees();
+        console.log("Starting total fees after first raffle:", startingTotalFees);
 
-        // Send ether to the contract
-        (bool success, ) = address(puppyRaffle).call{value: fee}("");
-        assertTrue(success);
+        // We then have 95 players enter a new raffle (to exceed uint64 max with fees)
+        uint256 playersNum = 95;
+        address[] memory players = new address[](playersNum);
+        for (uint256 i = 0; i < playersNum; i++) {
+            players[i] = address(uint160(i + 100)); // Avoid address conflicts
+        }
+        puppyRaffle.enterRaffle{value: entranceFee * playersNum}(players);
+        
+        // Calculate expected fee from this raffle
+        uint256 expectedNewFee = (entranceFee * playersNum * 20) / 100;
+        uint256 expectedTotalFees = startingTotalFees + expectedNewFee;
+        console.log("Expected new fee from 95 players:", expectedNewFee);
+        console.log("Expected total fees:", expectedTotalFees);
+        
+        // We end the raffle
+        vm.warp(block.timestamp + duration + 1);
+        vm.roll(block.number + 1);
 
-        uint256 finalBalance = address(puppyRaffle).balance;
+        // Calculate what actually happens with uint64 casting
+        uint64 castedNewFee = uint64(expectedNewFee);
+        uint256 actualExpectedTotal = startingTotalFees + castedNewFee;
+        
+        console.log("New fee before uint64 cast:", expectedNewFee);
+        console.log("New fee after uint64 cast:", castedNewFee);
+        console.log("Fee loss due to uint64 cast:", expectedNewFee - castedNewFee);
+        console.log("Actual expected total (with cast):", actualExpectedTotal);
+        
+        // And here is where the issue occurs
+        // The uint64 casting will truncate the large fee value
+        puppyRaffle.selectWinner();
 
-        // Check if the contract's balance increased by the expected amount
-        assertEq(finalBalance, initialBalance + fee);
+        uint256 endingTotalFees = puppyRaffle.totalFees();
+        console.log("Actual ending total fees:", endingTotalFees);
+        
+        // The vulnerability: uint64 casting causes massive fee loss
+        assertEq(endingTotalFees, actualExpectedTotal, "Total fees should match uint64-casted amount");
+        assertTrue(castedNewFee < expectedNewFee, "uint64 cast should truncate large values");
+
+        // We are also unable to withdraw any fees because of the require check
+        vm.expectRevert("PuppyRaffle: There are currently players active!");
+        puppyRaffle.withdrawFees();
+        
+        console.log("=== Real-world overflow scenario confirmed ===");
+        console.log("- Multiple raffles cause fee accounting corruption");
+        console.log("- Protocol loses accumulated fees");
+        console.log("- Withdrawal functionality breaks");
     }
 
      function testReentrancy() public {
@@ -299,6 +391,15 @@ contract PuppyRaffleTest is Test {
 
         console.log("ending attacker contract balance:", address(attackerContract).balance);
         console.log("ending puppy raffle balance:", address(puppyRaffle).balance);
+    }
+
+    function testCantSendMoneyToRaffle() public {
+        address senderAddy = makeAddr("sender");
+        vm.deal(senderAddy, 1 ether);
+        vm.expectRevert();
+        vm.prank(senderAddy);
+        (bool success,) = payable(address(puppyRaffle)).call{value: 1 ether}("");
+        require(success);
     }
 }
 
